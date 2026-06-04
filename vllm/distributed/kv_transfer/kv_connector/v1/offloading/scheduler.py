@@ -18,6 +18,11 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    ExternalBlockHash,
+    maybe_convert_block_hash,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -39,6 +44,20 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class _OffloadStoreMetadata(NamedTuple):
+    """Per-key metadata needed to enrich BlockStored events in take_events.
+
+    Populated when new_offload_keys are built for prepare_store. Drained
+    when take_events emits the corresponding BlockStored.
+    Without this, downstream consumers (e.g. Dynamo Router) can't index
+    offloaded blocks by token prefix.
+    """
+
+    token_ids: list[int]
+    parent_block_hash: ExternalBlockHash | None
+    block_size: int
 
 
 @dataclass(slots=True)
@@ -305,6 +324,12 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+
+        # OffloadKey -> (token_ids, parent_block_hash, block_size). Populated
+        # at prepare_store time so take_events can emit BlockStored events
+        # with token_ids and parent_block_hash matching the native GPU
+        # BlockStored stream from block_pool.py.
+        self._offload_key_metadata: dict[OffloadKey, _OffloadStoreMetadata] = {}
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -755,6 +780,7 @@ class OffloadingConnectorScheduler:
                 ):
                     if block_id == 0:
                         continue
+                    abs_block_idx = start_block_idx + key_idx
                     # Skip SWA blocks that can never serve a load hit:
                     # within each full-attention alignment segment, only the
                     # trailing `tail` blocks are reachable by
@@ -762,11 +788,13 @@ class OffloadingConnectorScheduler:
                     # tokens this reduces SWA stores by ~78%.
                     if alignment_block_count is not None:
                         assert tail is not None
-                        abs_block_idx = start_block_idx + key_idx
                         pos_in_segment = abs_block_idx % alignment_block_count
                         if pos_in_segment < alignment_block_count - tail:
                             continue
                     new_offload_keys.append(offload_key)
+                    self._record_offload_metadata(
+                        offload_key, abs_block_idx, group_config, req_status.req
+                    )
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
@@ -986,26 +1014,95 @@ class OffloadingConnectorScheduler:
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
         return False, None
 
+    def _record_offload_metadata(
+        self,
+        offload_key: OffloadKey,
+        abs_block_idx: int,
+        group_config: GroupOffloadConfig,
+        req: Request,
+    ) -> None:
+        """Remember the per-key data needed to emit a complete BlockStored.
+
+        Token range covered by an offload_key at ``abs_block_idx`` is
+        ``[abs_block_idx * b, (abs_block_idx + 1) * b)`` where ``b`` is
+        the group's ``offloaded_block_size``. The parent is the offload
+        block at ``abs_block_idx - 1`` whose hash sits at
+        ``req.block_hashes[abs_block_idx * hash_block_size_factor - 1]``.
+        Missing metadata at take_events time falls back to the legacy
+        empty-token_ids behavior so consumers that ignored those fields
+        keep working.
+        """
+        block_size = group_config.offloaded_block_size
+        start_token = abs_block_idx * block_size
+        end_token = start_token + block_size
+        token_ids = list(req.all_token_ids[start_token:end_token])
+
+        parent_block_hash: ExternalBlockHash | None = None
+        parent_idx = abs_block_idx * group_config.hash_block_size_factor - 1
+        if 0 <= parent_idx < len(req.block_hashes):
+            parent_block_hash = maybe_convert_block_hash(
+                req.block_hashes[parent_idx]
+            )
+
+        self._offload_key_metadata[offload_key] = _OffloadStoreMetadata(
+            token_ids=token_ids,
+            parent_block_hash=parent_block_hash,
+            block_size=block_size,
+        )
+
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Take the KV cache events from the connector.
+
+        BlockStored events are enriched with token_ids / parent_block_hash
+        / block_size from ``_offload_key_metadata`` so downstream
+        consumers (e.g. Dynamo Router) can index the offloaded blocks the
+        same way they index native GPU BlockStored events from
+        block_pool.py. One BlockStored is emitted per offload_key to
+        preserve correctness when SWA filtering leaves gaps in the
+        prefix chain.
 
         Returns:
             A list of KV cache events.
         """
         for event in self.manager.take_events():
-            block_hashes = [get_offload_block_hash(key) for key in event.keys]
             if event.removed:
-                yield BlockRemoved(block_hashes=block_hashes, medium=event.medium)
-            else:
-                yield BlockStored(
-                    block_hashes=block_hashes,
-                    parent_block_hash=None,
-                    token_ids=[],
-                    lora_id=None,
-                    block_size=0,
-                    medium=event.medium,
-                    lora_name=None,
+                block_hashes: list[ExternalBlockHash] = []
+                for key in event.keys:
+                    self._offload_key_metadata.pop(key, None)
+                    block_hashes.append(
+                        maybe_convert_block_hash(
+                            BlockHash(get_offload_block_hash(key))
+                        )
+                    )
+                yield BlockRemoved(
+                    block_hashes=block_hashes, medium=event.medium
                 )
+            else:
+                for key in event.keys:
+                    block_hash = maybe_convert_block_hash(
+                        BlockHash(get_offload_block_hash(key))
+                    )
+                    meta = self._offload_key_metadata.get(key)
+                    if meta is None:
+                        yield BlockStored(
+                            block_hashes=[block_hash],
+                            parent_block_hash=None,
+                            token_ids=[],
+                            lora_id=None,
+                            block_size=0,
+                            medium=event.medium,
+                            lora_name=None,
+                        )
+                        continue
+                    yield BlockStored(
+                        block_hashes=[block_hash],
+                        parent_block_hash=meta.parent_block_hash,
+                        token_ids=meta.token_ids,
+                        lora_id=None,
+                        block_size=meta.block_size,
+                        medium=event.medium,
+                        lora_name=None,
+                    )
 
     def reset_cache(self) -> None:
         """Reset the offloading manager cache, evicting all stored blocks."""
@@ -1029,6 +1126,7 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        self._offload_key_metadata.clear()
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.
         # The load flush IDs collected above must be delivered to workers.
