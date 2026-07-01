@@ -1,0 +1,37 @@
+prompts:
+  - "{{prompt}}"
+
+providers:
+  - id: openai:chat:/images/models/Qwen/Qwen3-0.6B-FP8
+    label: local-vllm
+    config:
+      apiBaseUrl: http://127.0.0.1:8000/v1
+      apiKey: EMPTY
+      temperature: 0
+      top_p: 1
+      max_tokens: 128
+      passthrough:
+        chat_template_kwargs:
+          enable_thinking: false
+
+tests:
+  - description: exact echo
+    vars:
+      prompt: "Return exactly this string and nothing else: KV_CACHE_OK_17"
+    assert:
+      - type: equals
+        value: "KV_CACHE_OK_17"
+
+  - description: arithmetic
+    vars:
+      prompt: "Answer with only the final integer. What is 137 + 268 - 45?"
+    assert:
+      - type: contains
+        value: "360"
+
+  - description: contains sanity
+    vars:
+      prompt: "Say the phrase CACHE PASS in a short sentence."
+    assert:
+      - type: contains
+        value: "CACHE PASS"
