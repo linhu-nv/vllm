@@ -63,6 +63,102 @@ primary_tier = manager.primary_tier                       # CPUPrimaryTierOffloa
 GPU workers still run in real subprocesses via the normal executor; only the
 scheduler/manager stays in this process.
 
+## Architecture
+
+```mermaid
+graph TD
+    subgraph proc["Single OS process (validate_pinning.py)"]
+        CF["Cache-fill client<br/>(make_distinct_prompts, fill_cache)"]
+        KD["Key-discovery client<br/>(BlockKeyListener,<br/>ZMQ SUB, background thread)"]
+        NT["NIXL tester client<br/>(NixlPinTester)"]
+        NTA["Tester's own NIXL agent<br/>+ own DRAM buffer"]
+
+        subgraph engine["vLLM engine (InprocClient — same process)"]
+            SCHED["EngineCore / Scheduler"]
+            OC["OffloadingConnector"]
+            TM["TieringOffloadingManager"]
+            PT["CPUPrimaryTierOffloadingManager<br/>(primary tier)"]
+            PTA["Primary tier's NIXL agent"]
+            DRAM["CPU/DRAM mmap region<br/>(SharedOffloadRegion)"]
+        end
+
+        CF -->|"llm.generate(prompts)"| SCHED
+        SCHED --> OC --> TM --> PT
+        PT --- PTA
+        PT --- DRAM
+
+        SCHED -.->|"KV events (ZMQ pub,<br/>medium == CPU)"| KD
+        KD -->|"snapshot(): resident OffloadKeys"| NT
+
+        NT -->|"get_transport_endpoint()<br/>search_and_pin(keys)<br/>unpin(handle)<br/>get_kv_memoryview()<br/>(direct in-process calls)"| PT
+        NT --- NTA
+        PTA -->|"real UCX READ transfer<br/>(actual DRAM bytes)"| NTA
+    end
+
+    subgraph gpu["GPU worker subprocess(es)"]
+        W["CPUOffloadingWorker<br/>(normal GPU↔CPU KV path;<br/>not the focus of this harness)"]
+    end
+
+    SCHED --- W
+```
+
+Everything except the GPU workers lives in one OS process (see "Why one
+process" above), but the three client roles are kept as separate components
+with no shared state beyond what's shown: the key-discovery client only
+ever sees the ZMQ wire, and the NIXL tester only reaches the primary tier
+through the same three APIs an external caller would use.
+
+## Workflow
+
+```mermaid
+sequenceDiagram
+    participant CF as Cache-fill client
+    participant Eng as vLLM engine<br/>(scheduler + primary tier)
+    participant KD as Key-discovery client<br/>(BlockKeyListener)
+    participant NT as NIXL tester client<br/>(NixlPinTester)
+    participant PTA as Primary tier's<br/>NIXL agent
+
+    KD->>KD: start ZMQ SUB listener (background thread)
+    CF->>Eng: generate(fill_prompts)
+    Eng-->>KD: KV events (BlockStored, medium == CPU)
+    KD->>KD: snapshot += resident OffloadKeys
+
+    NT->>KD: snapshot()
+    KD-->>NT: resident OffloadKeys
+    NT->>NT: pick random subset (chosen_keys)
+
+    NT->>Eng: search_and_pin(chosen_keys)
+    Eng-->>NT: pin_handle, mapping of key to MemDescriptor
+    Note over Eng: ref_cnt goes from 0 to 1, keys removed<br/>from evictable_blocks
+
+    NT->>Eng: get_transport_endpoint()
+    Eng-->>NT: primary NIXL agent + get_agent_metadata()
+    NT->>PTA: add_remote_agent(metadata)
+    NT->>Eng: get_kv_memoryview(), snapshot reference bytes
+
+    loop for each pinned key
+        NT->>PTA: initialize_xfer(READ) / transfer()
+        PTA-->>NT: real DRAM bytes over UCX
+        NT->>NT: poll check_xfer_state until DONE
+    end
+
+    CF->>Eng: generate(pressure_prompts)
+    Eng->>Eng: evicts non-pinned CPU-tier blocks<br/>(real capacity pressure)
+    Eng-->>KD: KV events (BlockStored / BlockRemoved)
+
+    NT->>Eng: lookup(chosen_keys)
+    Eng-->>NT: HIT — pinned blocks survived
+
+    NT->>NT: sha256 + byte-equality check<br/>(reference vs. NIXL-pulled bytes)
+
+    NT->>Eng: unpin(pin_handle)
+    Eng-->>NT: True
+    Note over Eng: ref_cnt goes from 1 to 0, keys back in<br/>evictable_blocks
+
+    NT->>Eng: unpin(pin_handle) again
+    Eng-->>NT: False
+```
+
 ## The three roles
 
 Even though everything runs in one process, the script keeps three
