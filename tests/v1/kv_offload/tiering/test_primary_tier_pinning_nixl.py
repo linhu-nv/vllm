@@ -21,6 +21,7 @@ import pytest
 
 from vllm.distributed import nixl_utils
 from vllm.v1.kv_offload.tiering.manager import CPUPrimaryTierOffloadingManager
+from vllm.v1.kv_offload.tiering.pinning import PrimaryPinningAPI
 
 from .test_tiering_offloading import _mock_mmap_region, store_ready_blocks, to_keys
 
@@ -47,6 +48,7 @@ class TestPrimaryTierPinningRealNixl:
         tester_agent = None
         tester_reg = None
         try:
+            pinning_api: PrimaryPinningAPI = primary_tier
             key = to_keys([0])[0]
             store_ready_blocks(primary_tier, [key])
             block = primary_tier._policy.get(key)
@@ -58,7 +60,7 @@ class TestPrimaryTierPinningRealNixl:
             view = primary_tier.get_kv_memoryview()
             view.obj[block.block_id, :] = np.frombuffer(pattern, dtype=np.int8)
 
-            pin_result = primary_tier.search_and_pin([key])
+            pin_result = pinning_api.search_and_pin([key])
             assert pin_result is not None
             pin_handle, descriptors = pin_result
             descriptor = descriptors[key]
@@ -66,7 +68,7 @@ class TestPrimaryTierPinningRealNixl:
             assert key not in primary_tier._policy.evictable_blocks
             assert primary_tier._num_evictable_cache_blocks == 0
 
-            primary_agent = primary_tier.get_transport_endpoint().end_point
+            primary_agent = pinning_api.get_transport_endpoint().end_point
 
             # Tester owns separate DRAM and a separate NIXL agent.
             tester_buf = np.zeros(descriptor.size, dtype=np.uint8)
@@ -97,10 +99,10 @@ class TestPrimaryTierPinningRealNixl:
 
             assert bytes(tester_buf) == pattern
 
-            assert primary_tier.unpin(pin_handle) is True
+            assert pinning_api.unpin(pin_handle) is True
             assert key in primary_tier._policy.evictable_blocks
             assert primary_tier._num_evictable_cache_blocks == 1
-            assert primary_tier.unpin(pin_handle) is False
+            assert pinning_api.unpin(pin_handle) is False
         finally:
             if tester_agent is not None and tester_reg is not None:
                 tester_agent.deregister_memory(tester_reg)

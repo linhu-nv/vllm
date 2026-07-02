@@ -39,8 +39,9 @@ from vllm.v1.kv_offload.tiering.base import (
 )
 from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
-from vllm.v1.kv_offload.tiering.framework_memory import (
+from vllm.v1.kv_offload.tiering.pinning import (
     MemDescriptor,
+    PrimaryPinningAPI,
     TransportEndpoint,
 )
 from vllm.v1.kv_offload.tiering.manager import (
@@ -227,11 +228,12 @@ class TestCPUPrimaryTierExternalPinning:
         primary_tier = CPUPrimaryTierOffloadingManager(
             num_blocks=2, mmap_region=_mock_mmap_region(2)
         )
+        pinning_api: PrimaryPinningAPI = primary_tier
 
         with pytest.raises(RuntimeError, match="external pinning"):
-            primary_tier.get_transport_endpoint()
+            pinning_api.get_transport_endpoint()
         with pytest.raises(RuntimeError, match="external pinning"):
-            primary_tier.search_and_pin(to_keys([0]))
+            pinning_api.search_and_pin(to_keys([0]))
 
     def test_external_pinning_initializes_endpoint_and_registers_mmap_once(
         self, fake_nixl
@@ -243,9 +245,10 @@ class TestCPUPrimaryTierExternalPinning:
             enable_external_pinning=True,
         )
 
+        pinning_api: PrimaryPinningAPI = primary_tier
         assert len(fake_nixl.instances) == 1
         agent = fake_nixl.instances[0]
-        endpoint = primary_tier.get_transport_endpoint()
+        endpoint = pinning_api.get_transport_endpoint()
         assert isinstance(endpoint, TransportEndpoint)
         assert endpoint.name == agent.name
         assert endpoint.end_point is agent
@@ -270,6 +273,7 @@ class TestCPUPrimaryTierExternalPinning:
         )
         key = to_keys([1])[0]
         store_ready_blocks(primary_tier, [key])
+        pinning_api: PrimaryPinningAPI = primary_tier
 
         block = primary_tier._policy.get(key)
         assert block is not None
@@ -282,7 +286,7 @@ class TestCPUPrimaryTierExternalPinning:
         row_addr = mock_region.base_addr + block.block_id * mock_region.row_stride_bytes
         view.obj[block.block_id, : len(sentinel)] = list(sentinel)
 
-        pin_result = primary_tier.search_and_pin([key])
+        pin_result = pinning_api.search_and_pin([key])
 
         assert pin_result is not None
         pin_handle, descriptors = pin_result
@@ -290,7 +294,7 @@ class TestCPUPrimaryTierExternalPinning:
         assert len(descriptors) == 1
         descriptor = descriptors[key]
         assert isinstance(descriptor, MemDescriptor)
-        assert descriptor.end_point_name == primary_tier.get_transport_endpoint().name
+        assert descriptor.end_point_name == pinning_api.get_transport_endpoint().name
         assert descriptor.mem_type == "DRAM"
         assert descriptor.addr == row_addr
         assert descriptor.size == mock_region.row_stride_bytes
@@ -301,11 +305,11 @@ class TestCPUPrimaryTierExternalPinning:
         assert key not in primary_tier._policy.evictable_blocks
         assert primary_tier._num_evictable_cache_blocks == 0
 
-        assert primary_tier.unpin(pin_handle) is True
+        assert pinning_api.unpin(pin_handle) is True
         assert block.ref_cnt == 0
         assert key in primary_tier._policy.evictable_blocks
         assert primary_tier._num_evictable_cache_blocks == 1
-        assert primary_tier.unpin(pin_handle) is False
+        assert pinning_api.unpin(pin_handle) is False
 
     def test_overlapping_pin_handles_preserve_refcounts(self, fake_nixl):
         primary_tier = CPUPrimaryTierOffloadingManager(
@@ -315,19 +319,20 @@ class TestCPUPrimaryTierExternalPinning:
         )
         keys = to_keys(range(3))
         store_ready_blocks(primary_tier, keys)
+        pinning_api: PrimaryPinningAPI = primary_tier
 
-        first_handle, _ = primary_tier.search_and_pin(keys[:2])
-        second_handle, _ = primary_tier.search_and_pin(keys[1:])
+        first_handle, _ = pinning_api.search_and_pin(keys[:2])
+        second_handle, _ = pinning_api.search_and_pin(keys[1:])
 
         blocks = [primary_tier._policy.get(key) for key in keys]
         assert [block.ref_cnt for block in blocks if block is not None] == [1, 2, 1]
 
-        assert primary_tier.unpin(first_handle) is True
+        assert pinning_api.unpin(first_handle) is True
         assert [block.ref_cnt for block in blocks if block is not None] == [0, 1, 1]
         assert keys[0] in primary_tier._policy.evictable_blocks
         assert keys[1] not in primary_tier._policy.evictable_blocks
 
-        assert primary_tier.unpin(second_handle) is True
+        assert pinning_api.unpin(second_handle) is True
         assert [block.ref_cnt for block in blocks if block is not None] == [0, 0, 0]
         assert all(key in primary_tier._policy.evictable_blocks for key in keys)
 
@@ -341,8 +346,9 @@ class TestCPUPrimaryTierExternalPinning:
         )
         ready_key, missing_key, pending_key = to_keys(range(3))
         store_ready_blocks(primary_tier, [ready_key])
+        pinning_api: PrimaryPinningAPI = primary_tier
 
-        assert primary_tier.search_and_pin([ready_key, missing_key]) is None
+        assert pinning_api.search_and_pin([ready_key, missing_key]) is None
         ready_block = primary_tier._policy.get(ready_key)
         assert ready_block is not None
         assert ready_block.ref_cnt == 0
@@ -354,7 +360,7 @@ class TestCPUPrimaryTierExternalPinning:
         assert pending_block is not None
         assert pending_block.ref_cnt == -1
 
-        assert primary_tier.search_and_pin([ready_key, pending_key]) is None
+        assert pinning_api.search_and_pin([ready_key, pending_key]) is None
         assert ready_block.ref_cnt == 0
         assert pending_block.ref_cnt == -1
         assert ready_key in primary_tier._policy.evictable_blocks
@@ -367,12 +373,13 @@ class TestCPUPrimaryTierExternalPinning:
         )
         key = to_keys([0])[0]
         store_ready_blocks(primary_tier, [key])
-        pin_handle, _ = primary_tier.search_and_pin([key])
+        pinning_api: PrimaryPinningAPI = primary_tier
+        pin_handle, _ = pinning_api.search_and_pin([key])
 
         with pytest.raises(RuntimeError, match="active external pins"):
             primary_tier.reset_cache()
 
-        assert primary_tier.unpin(pin_handle) is True
+        assert pinning_api.unpin(pin_handle) is True
         primary_tier.reset_cache()
         assert primary_tier.lookup(key, _CTX) is LookupResult.MISS
 

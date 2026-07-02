@@ -12,8 +12,8 @@ Drives a real vLLM engine (in-process InprocClient) through three roles:
    that reconstructs OffloadKeys for blocks resident in the CPU tier,
    purely from KV events -- it never touches the manager object.
 3. NIXL tester client (NixlPinTester): owns a second real NIXL agent and
-   DRAM buffer; calls get_transport_endpoint()/search_and_pin()/unpin()
-   directly on CPUPrimaryTierOffloadingManager and does real UCX transfers.
+   DRAM buffer; uses the PrimaryPinningAPI surface and does real UCX
+   transfers.
 
 See docs/superpowers/specs/2026-07-02-primary-tier-pinning-nixl-e2e-design.md
 for the full design and
@@ -58,7 +58,13 @@ from vllm.config.kv_events import KVEventsConfig
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed import nixl_utils
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVEventBatch
-from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    OffloadKey,
+    ReqContext,
+    make_offload_key,
+)
+from vllm.v1.kv_offload.tiering.pinning import PrimaryPinningAPI
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B-FP8"
 _CTX = ReqContext(req_id="nixl-pin-e2e")
@@ -162,7 +168,7 @@ class BlockKeyListener:
         self._sub.connect(endpoint)
         self._sub.setsockopt_string(zmq.SUBSCRIBE, topic)
         self._lock = threading.Lock()
-        self._keys: set[bytes] = set()
+        self._keys: set[OffloadKey] = set()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -175,7 +181,7 @@ class BlockKeyListener:
         self._sub.close()
         self._ctx.term()
 
-    def snapshot(self) -> set[bytes]:
+    def snapshot(self) -> set[OffloadKey]:
         with self._lock:
             return set(self._keys)
 
@@ -295,7 +301,7 @@ def fill_cache(llm: LLM, prompts: list[str]) -> None:
 
 def wait_for_listener_to_settle(
     listener: "BlockKeyListener", timeout: float = 10.0, quiet_period: float = 1.0
-) -> set[bytes]:
+) -> set[OffloadKey]:
     """Wait until the listener's key set stops changing.
 
     generate() can emit a large burst of BlockStored/BlockRemoved events
@@ -327,13 +333,14 @@ class NixlPinTester:
 
     def __init__(self, primary_tier):
         self.primary_tier = primary_tier
+        self.primary_pinning: PrimaryPinningAPI = primary_tier
         config_factory = nixl_utils.nixl_agent_config
         config = (
             config_factory(backends=["UCX"]) if config_factory is not None else None
         )
         agent_name = f"pin-tester-{uuid.uuid4().hex[:8]}"
         self.agent = nixl_utils.NixlWrapper(agent_name, config)
-        self._buffers: dict[bytes, np.ndarray] = {}
+        self._buffers: dict[OffloadKey, np.ndarray] = {}
         self._registrations: list[object] = []
 
     def close(self) -> None:
@@ -342,8 +349,8 @@ class NixlPinTester:
         self._registrations.clear()
 
     def pin_and_transfer(
-        self, keys: list[bytes]
-    ) -> tuple[str, dict[bytes, bytes]]:
+        self, keys: list[OffloadKey]
+    ) -> tuple[str, dict[OffloadKey, bytes]]:
         pre_evictable = self.primary_tier._num_evictable_cache_blocks
         blocks_before = {k: self.primary_tier._policy.get(k) for k in keys}
         for k in keys:
@@ -351,7 +358,7 @@ class NixlPinTester:
             assert block is not None, f"key {k!r} not found in primary tier"
             assert block.ref_cnt == 0, f"key {k!r} expected ref_cnt 0 before pin"
 
-        pin_result = self.primary_tier.search_and_pin(keys)
+        pin_result = self.primary_pinning.search_and_pin(keys)
         assert pin_result is not None, "search_and_pin unexpectedly failed"
         pin_handle, descriptors = pin_result
         assert len(descriptors) == len(keys)
@@ -377,7 +384,7 @@ class NixlPinTester:
             k: bytes(kv_view[blocks_before[k].block_id]) for k in keys
         }
 
-        primary_agent = self.primary_tier.get_transport_endpoint().end_point
+        primary_agent = self.primary_pinning.get_transport_endpoint().end_point
         self.agent.add_remote_agent(primary_agent.get_agent_metadata())
 
         for key, descriptor in descriptors.items():
@@ -385,7 +392,7 @@ class NixlPinTester:
 
         return pin_handle, reference_bytes
 
-    def _transfer_one(self, key: bytes, descriptor, primary_agent) -> None:
+    def _transfer_one(self, key: OffloadKey, descriptor, primary_agent) -> None:
         buf = np.zeros(descriptor.size, dtype=np.uint8)
         reg = self.agent.register_memory(
             [(buf.ctypes.data, buf.nbytes, 0, "")], mem_type="DRAM"
@@ -411,7 +418,9 @@ class NixlPinTester:
         finally:
             self.agent.release_xfer_handle(handle)
 
-    def assert_transfer_correct(self, reference_bytes: dict[bytes, bytes]) -> None:
+    def assert_transfer_correct(
+        self, reference_bytes: dict[OffloadKey, bytes]
+    ) -> None:
         for key, reference in reference_bytes.items():
             pulled = bytes(self._buffers[key])
             ref_digest = hashlib.sha256(reference).hexdigest()
@@ -422,15 +431,15 @@ class NixlPinTester:
             )
             assert pulled == reference, f"byte mismatch for key {key!r}"
 
-    def assert_still_pinned(self, keys: list[bytes]) -> None:
+    def assert_still_pinned(self, keys: list[OffloadKey]) -> None:
         for k in keys:
             assert self.primary_tier.lookup(k, _CTX) is LookupResult.HIT, (
                 f"pinned key {k!r} did not survive competing eviction pressure"
             )
 
-    def unpin_and_assert(self, pin_handle: str, keys: list[bytes]) -> None:
+    def unpin_and_assert(self, pin_handle: str, keys: list[OffloadKey]) -> None:
         pre_evictable = self.primary_tier._num_evictable_cache_blocks
-        assert self.primary_tier.unpin(pin_handle) is True
+        assert self.primary_pinning.unpin(pin_handle) is True
 
         for k in keys:
             block = self.primary_tier._policy.get(k)
@@ -443,7 +452,7 @@ class NixlPinTester:
             == pre_evictable + len(keys)
         ), "evictable-block counter did not rise by exactly len(keys)"
 
-        assert self.primary_tier.unpin(pin_handle) is False, (
+        assert self.primary_pinning.unpin(pin_handle) is False, (
             "second unpin of the same handle should return False"
         )
 

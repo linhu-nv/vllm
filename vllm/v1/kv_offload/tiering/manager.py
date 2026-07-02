@@ -52,14 +52,13 @@ from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
     SecondaryTierManager,
 )
-from vllm.v1.kv_offload.tiering.framework_memory import (
+from vllm.v1.kv_offload.tiering.pinning import (
     MemDescriptor,
+    PinHandle,
     TransportEndpoint,
 )
 
 logger = init_logger(__name__)
-
-PinHandle = str
 
 
 @dataclass
@@ -160,6 +159,9 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         self,
         keys: Collection[OffloadKey],
     ) -> tuple[PinHandle, dict[OffloadKey, MemDescriptor]] | None:
+        # The primary tier exposes one contiguous canonical memory row per key,
+        # including layouts that differ across attention heads. If that
+        # canonical form ever becomes split, MemDescriptor can become a list.
         if not self.enable_external_pinning:
             raise RuntimeError("external pinning is not enabled for this primary tier")
 
