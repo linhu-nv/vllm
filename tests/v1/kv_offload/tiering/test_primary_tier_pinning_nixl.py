@@ -3,9 +3,10 @@
 """
 Real-NIXL validation of the primary-tier pin/export API.
 
-This exercises the "First Validation" scenario from
-plans/vllm_primary_tier_pinning_api.md: a tester that owns separate DRAM and
-a separate NIXL agent pins a ready primary-tier block via search_and_pin(),
+This exercises the "First Validation" scenario from the design note
+vllm_primary_tier_pinning_api.md (kept outside this git repo, alongside the
+checkout it applies to): a tester that owns separate DRAM and a separate
+NIXL agent pins a ready primary-tier block via search_and_pin(),
 reads the bytes described by the returned MemDescriptor into tester-owned
 memory over a real NIXL transfer, verifies them, and unpins. It also checks
 eviction protection: a pinned block must not be evictable, and must become
