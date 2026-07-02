@@ -59,6 +59,8 @@ from vllm.v1.kv_offload.tiering.framework_memory import (
 
 logger = init_logger(__name__)
 
+PinHandle = str
+
 
 @dataclass
 class PendingPromotion:
@@ -118,7 +120,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     def _init_external_pinning(self) -> None:
         self._kv_base_addr = self._mmap_region.base_addr
         self._kv_row_stride = self._mmap_region.row_stride_bytes
-        self._pin_handles: dict[str, tuple[OffloadKey, ...]] = {}
+        self._pin_handles: dict[PinHandle, tuple[OffloadKey, ...]] = {}
         self._transport_endpoint_info = "nixl"
         self._transport_memory_registration: object | None = None
 
@@ -157,7 +159,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     def search_and_pin(
         self,
         keys: Collection[OffloadKey],
-    ) -> tuple[str, list[MemDescriptor]] | None:
+    ) -> tuple[PinHandle, dict[OffloadKey, MemDescriptor]] | None:
         if not self.enable_external_pinning:
             raise RuntimeError("external pinning is not enabled for this primary tier")
 
@@ -170,7 +172,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
                 return None
             blocks.append(block)
 
-        descriptors = []
+        descriptors: dict[OffloadKey, MemDescriptor] = {}
         for key, block in zip(pin_keys, blocks):
             if block.ref_cnt == 0:
                 self._policy.mark_non_evictable(key)
@@ -180,7 +182,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
                         "primary-tier evictable block count became negative"
                     )
             block.ref_cnt += 1
-            descriptors.append(self._make_mem_descriptor(block.block_id))
+            descriptors[key] = self._make_mem_descriptor(block.block_id)
 
         pin_handle = uuid.uuid4().hex
         self._pin_handles[pin_handle] = pin_keys
@@ -196,7 +198,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
             info="",
         )
 
-    def unpin(self, pin_handle: str) -> bool:
+    def unpin(self, pin_handle: PinHandle) -> bool:
         if not self.enable_external_pinning:
             return False
 

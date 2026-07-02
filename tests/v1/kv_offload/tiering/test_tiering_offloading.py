@@ -288,7 +288,7 @@ class TestCPUPrimaryTierExternalPinning:
         pin_handle, descriptors = pin_result
         assert pin_handle
         assert len(descriptors) == 1
-        descriptor = descriptors[0]
+        descriptor = descriptors[key]
         assert isinstance(descriptor, MemDescriptor)
         assert descriptor.end_point_name == primary_tier.get_transport_endpoint().name
         assert descriptor.mem_type == "DRAM"

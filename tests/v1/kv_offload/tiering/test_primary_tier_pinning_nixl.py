@@ -60,7 +60,7 @@ class TestPrimaryTierPinningRealNixl:
             pin_result = primary_tier.search_and_pin([key])
             assert pin_result is not None
             pin_handle, descriptors = pin_result
-            descriptor = descriptors[0]
+            descriptor = descriptors[key]
 
             assert key not in primary_tier._policy.evictable_blocks
             assert primary_tier._num_evictable_cache_blocks == 0
