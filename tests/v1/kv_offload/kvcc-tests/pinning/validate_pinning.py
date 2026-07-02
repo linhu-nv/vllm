@@ -451,15 +451,20 @@ class NixlPinTester:
 def run(args: argparse.Namespace) -> None:
     """
     GPU->CPU offload is write-through, not GPU-pressure-driven:
-    OffloadingConnectorScheduler.build_connector_meta() calls
+    
+    1. OffloadingConnectorScheduler.build_connector_meta() calls
     _build_store_jobs() every scheduler step, which stores every
     newly-computed prefill block to the CPU tier immediately
     (vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py:844).
-    TieringOffloadingSpec also forces store_threshold=1 (spec.py:178), so
-    there's no repeated-access gate either. So getting blocks into the CPU
-    tier only needs cpu_bytes_to_use > 0 and prompts long enough to span at
-    least one full block -- GPU cache size plays no role in that. The
-    later "pressure" batch is a different mechanism: it's sized (via
+    
+    2. TieringOffloadingSpec also forces store_threshold=1 (spec.py:178), so
+    there's no repeated-access gate either. 
+    
+    So getting blocks into the CPU tier only needs cpu_bytes_to_use > 0 and 
+    prompts long enough to span at least one full block -- GPU cache size 
+    plays no role in that. 
+    
+    The later "pressure" batch is a different mechanism: it's sized (via
     --cpu-offload-gb) to fill the CPU tier itself, forcing a real
     CPU-tier eviction that the pinned blocks must survive.
     """

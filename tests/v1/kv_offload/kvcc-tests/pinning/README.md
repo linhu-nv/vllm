@@ -188,6 +188,63 @@ and startup time down.
 Because this is the synchronous offline engine, nothing else steps the
 scheduler between calls — state is stable the moment `.generate()` returns.
 
+#### How `build_llm()` ensures this
+
+Write-through isn't a flag the script flips — `_build_store_jobs()` has no
+non-write-through code path, so there's nothing to turn on. What
+`build_llm()` actually has to get right is making that path reachable and
+unobstructed:
+
+```python
+kv_transfer_config = KVTransferConfig(
+    kv_connector="OffloadingConnector",
+    kv_role="kv_both",
+    kv_connector_extra_config={
+        "spec_name": "TieringOffloadingSpec",
+        "cpu_bytes_to_use": args.cpu_offload_gb * (1 << 30),
+        "enable_external_pinning": True,
+    },
+)
+...
+return LLM(..., enable_prefix_caching=True, ...)
+```
+
+1. **`kv_connector="OffloadingConnector"`** activates
+   `OffloadingConnectorScheduler`, the class whose `build_connector_meta()`
+   unconditionally calls `_build_store_jobs()` every step. Selecting a
+   different connector would mean this write-through path doesn't exist at
+   all in the running engine.
+2. **`spec_name="TieringOffloadingSpec"`** — required for
+   `search_and_pin`/`unpin`/`get_transport_endpoint` to exist on the
+   manager at all (the default `CPUOffloadingSpec` doesn't have them). Side
+   effect relevant here: this spec (`spec.py:178`) actively *rejects* any
+   config that raises `store_threshold >= 2`, so there's no way to
+   accidentally turn write-through into "store only after N repeated
+   accesses" while using it — `store_threshold` stays pinned at its
+   default of `1`.
+3. **`cpu_bytes_to_use` > 0** (via `--cpu-offload-gb`) — gives the CPU tier
+   nonzero capacity. Without this, `prepare_store` has nowhere to put
+   blocks and every store attempt fails regardless of write-through being
+   architecturally "on".
+4. **`enable_prefix_caching=True`** — `_build_store_jobs()` needs each
+   request's per-block hashes (`req.block_hashes`) to build `OffloadKey`s;
+   that hashing infrastructure is shared with GPU prefix caching, so it has
+   to be enabled for the connector to have anything to offload.
+
+Notably absent from this list: `--gpu-memory-utilization` /
+`--num-gpu-blocks`. They're set small purely to keep the test's GPU
+footprint and startup time down — `_build_store_jobs()` never checks GPU
+cache pressure, so they have no bearing on whether write-through offload
+happens.
+
+The script's only *runtime* confirmation that this actually worked is
+empirical, not configured: after the first `fill_cache()` call, `run()`
+waits for `BlockKeyListener.snapshot()` to become non-empty and prints
+`"Discovered N resident CPU-tier block keys"`. If the connector/spec wiring
+were wrong, or `cpu_bytes_to_use` were `0`, that set would stay empty and
+`run()` raises `RuntimeError("No blocks observed in the CPU tier. ...")`
+instead of silently continuing — see Troubleshooting.
+
 ### 2. Key-discovery client (`BlockKeyListener`)
 
 A standalone component that never touches the manager object — it only
