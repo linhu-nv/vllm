@@ -393,6 +393,264 @@ class TestCPUPrimaryTierExternalPinning:
                 enable_external_pinning=True,
             )
 
+    def test_concurrent_pin_unpin_ref_count_balance(self, fake_nixl):
+        """N threads pin the same key set thousands of times and each
+        unpins its own handle. After every thread joins, ref_cnt on
+        every block must be exactly 0 and the block must be back in
+        the evictable set. Ref-count leaks or double-releases surface
+        as a non-zero final ref_cnt."""
+        import threading
+
+        num_blocks = 8
+        primary_tier = CPUPrimaryTierOffloadingManager(
+            num_blocks=num_blocks,
+            mmap_region=_mock_mmap_region(num_blocks),
+            enable_external_pinning=True,
+        )
+        pinning_api: PrimaryPinningAPI = primary_tier
+        keys = to_keys(range(num_blocks))
+        store_ready_blocks(primary_tier, keys)
+
+        n_threads = 8
+        iters_per_thread = 500
+        errors: list[str] = []
+
+        def worker() -> None:
+            for _ in range(iters_per_thread):
+                pin_result = pinning_api.search_and_pin(keys)
+                if pin_result is None:
+                    errors.append("search_and_pin returned None")
+                    return
+                pin_handle, descriptors = pin_result
+                if len(descriptors) != num_blocks:
+                    errors.append(
+                        f"expected {num_blocks} descs, got {len(descriptors)}"
+                    )
+                    return
+                if not pinning_api.unpin(pin_handle):
+                    errors.append(f"unpin({pin_handle}) returned False")
+                    return
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, errors[:5]
+        for key in keys:
+            block = primary_tier._policy.get(key)
+            assert block is not None
+            assert block.ref_cnt == 0, (
+                f"block {key!r} leaked ref_cnt={block.ref_cnt}"
+            )
+            assert key in primary_tier._policy.evictable_blocks
+        assert primary_tier._num_evictable_cache_blocks == num_blocks
+        assert not primary_tier._has_active_external_pins()
+
+    def test_concurrent_overlapping_pins_no_lost_handles(self, fake_nixl):
+        """Multiple threads pin overlapping subsets of the same key
+        set concurrently, each unpins its own handle. Ref-counts on
+        keys covered by many concurrent handles must reach 0 after
+        every handle is released; no pin_handle may be lost or
+        double-released."""
+        import random
+        import threading
+
+        num_blocks = 12
+        primary_tier = CPUPrimaryTierOffloadingManager(
+            num_blocks=num_blocks,
+            mmap_region=_mock_mmap_region(num_blocks),
+            enable_external_pinning=True,
+        )
+        pinning_api: PrimaryPinningAPI = primary_tier
+        keys = to_keys(range(num_blocks))
+        store_ready_blocks(primary_tier, keys)
+
+        n_threads = 6
+        iters_per_thread = 200
+        errors: list[str] = []
+
+        def worker(seed: int) -> None:
+            rng = random.Random(seed)
+            for _ in range(iters_per_thread):
+                # Random contiguous slice of the key set — overlaps with
+                # what other threads picked with high probability.
+                start = rng.randrange(0, num_blocks)
+                end = rng.randrange(start + 1, num_blocks + 1)
+                subset = keys[start:end]
+                pin_result = pinning_api.search_and_pin(subset)
+                if pin_result is None:
+                    errors.append(f"search_and_pin returned None for {subset!r}")
+                    return
+                pin_handle, descriptors = pin_result
+                if set(descriptors.keys()) != set(subset):
+                    errors.append(
+                        f"descriptors keys {set(descriptors.keys())!r} "
+                        f"!= subset {set(subset)!r}"
+                    )
+                    return
+                if not pinning_api.unpin(pin_handle):
+                    errors.append(f"unpin({pin_handle}) returned False")
+                    return
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, errors[:5]
+        for key in keys:
+            block = primary_tier._policy.get(key)
+            assert block is not None
+            assert block.ref_cnt == 0, (
+                f"block {key!r} leaked ref_cnt={block.ref_cnt}"
+            )
+            assert key in primary_tier._policy.evictable_blocks
+        assert primary_tier._num_evictable_cache_blocks == num_blocks
+        assert not primary_tier._has_active_external_pins()
+
+    def test_pin_unpin_survives_concurrent_eviction_pressure(self, fake_nixl):
+        """Pin/unpin threads run against a small pool while a separate
+        thread continuously drives LRU eviction by storing new keys.
+
+        Two invariants under stress:
+          1. search_and_pin / unpin / prepare_store never raise — a key
+             that was concurrently evicted must surface as a graceful
+             `search_and_pin -> None`, not a KeyError inside
+             mark_non_evictable.
+          2. Any block that survives the run has ref_cnt == 0 and no
+             external pin_handle is leaked.
+
+        This exercises the read-modify-write window inside
+        search_and_pin (lookup loop -> ref_cnt++/mark_non_evictable
+        loop). If eviction slips into that window, the second loop
+        would try to delete an already-evicted key from
+        evictable_blocks. On the current implementation this passes
+        under GIL scheduling; if you later introduce a per-block lock
+        or restructure the two loops, this test guards against
+        regressions.
+        """
+        import random
+        import threading
+        import time
+
+        num_blocks = 8
+        primary_tier = CPUPrimaryTierOffloadingManager(
+            num_blocks=num_blocks,
+            mmap_region=_mock_mmap_region(num_blocks),
+            enable_external_pinning=True,
+        )
+        pinning_api: PrimaryPinningAPI = primary_tier
+        base_keys = to_keys(range(num_blocks))
+        store_ready_blocks(primary_tier, base_keys)
+
+        stop_flag = threading.Event()
+        pin_errors: list[str] = []
+        evict_errors: list[str] = []
+        pin_ops = [0]
+        evict_ops = [0]
+
+        def pin_worker(seed: int) -> None:
+            rng = random.Random(seed)
+            try:
+                while not stop_flag.is_set():
+                    subset_size = rng.randint(1, 3)
+                    subset = rng.sample(base_keys, subset_size)
+                    result = pinning_api.search_and_pin(subset)
+                    if result is None:
+                        # Block(s) evicted before we could pin — graceful miss.
+                        continue
+                    handle, _descs = result
+                    if not pinning_api.unpin(handle):
+                        pin_errors.append(f"unpin returned False for {handle}")
+                        return
+                    pin_ops[0] += 1
+            except Exception as e:
+                pin_errors.append(f"{type(e).__name__}: {e}")
+
+        def evict_worker() -> None:
+            # Store fresh keys past capacity to force LRU eviction of
+            # base_keys that happen to be evictable (ref_cnt == 0) at
+            # that moment.
+            counter = num_blocks
+            try:
+                while not stop_flag.is_set():
+                    new_key = to_keys([counter])[0]
+                    counter += 1
+                    result = primary_tier.prepare_store([new_key], _CTX)
+                    if result is None:
+                        continue
+                    primary_tier.complete_store([new_key], _CTX, success=True)
+                    evict_ops[0] += 1
+            except Exception as e:
+                evict_errors.append(f"{type(e).__name__}: {e}")
+
+        threads = [
+            threading.Thread(target=pin_worker, args=(1,)),
+            threading.Thread(target=pin_worker, args=(2,)),
+            threading.Thread(target=evict_worker),
+        ]
+        for t in threads:
+            t.start()
+        time.sleep(1.0)
+        stop_flag.set()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        assert not pin_errors, f"pin worker failed: {pin_errors[:3]}"
+        assert not evict_errors, f"evict worker failed: {evict_errors[:3]}"
+        assert pin_ops[0] > 10, f"pin loop barely ran: {pin_ops[0]}"
+        assert evict_ops[0] > 5, f"evict loop barely ran: {evict_ops[0]}"
+
+        assert not primary_tier._has_active_external_pins()
+        for key in base_keys:
+            block = primary_tier._policy.get(key)
+            if block is not None:
+                assert block.ref_cnt == 0, (
+                    f"surviving block {key!r} leaked ref_cnt={block.ref_cnt}"
+                )
+
+    def test_many_outstanding_pins_release_cleanly(self, fake_nixl):
+        """Stress the pin-handle table: create N outstanding pins on
+        disjoint singleton keys, then release them all. Verifies the
+        _pin_handles dict scales past small counts without collisions
+        or leaked entries."""
+        num_blocks = 500
+        primary_tier = CPUPrimaryTierOffloadingManager(
+            num_blocks=num_blocks,
+            mmap_region=_mock_mmap_region(num_blocks),
+            enable_external_pinning=True,
+        )
+        pinning_api: PrimaryPinningAPI = primary_tier
+        keys = to_keys(range(num_blocks))
+        store_ready_blocks(primary_tier, keys)
+
+        handles = []
+        for key in keys:
+            pin_result = pinning_api.search_and_pin([key])
+            assert pin_result is not None
+            handle, descriptors = pin_result
+            assert len(descriptors) == 1
+            assert key in descriptors
+            handles.append(handle)
+
+        # Every block is pinned exactly once, none evictable.
+        assert len(set(handles)) == num_blocks, "pin_handles collided"
+        for key in keys:
+            block = primary_tier._policy.get(key)
+            assert block is not None
+            assert block.ref_cnt == 1
+        assert primary_tier._num_evictable_cache_blocks == 0
+
+        for handle in handles:
+            assert pinning_api.unpin(handle) is True
+        for key in keys:
+            assert primary_tier._policy.get(key).ref_cnt == 0
+        assert primary_tier._num_evictable_cache_blocks == num_blocks
+        assert not primary_tier._has_active_external_pins()
+
 
 def test_tiering_spec_passes_external_pinning_flag(monkeypatch):
     class FakeSharedOffloadRegion:
